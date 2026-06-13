@@ -1,129 +1,133 @@
-import time
 import asyncio
-from telethon.sync import TelegramClient
-from telethon import errors
+from telethon import TelegramClient, events, errors
 
 class TelegramForwarder:
     def __init__(self, api_id, api_hash, phone_number):
-        self.api_id = api_id
+        self.api_id = int(api_id)
         self.api_hash = api_hash
         self.phone_number = phone_number
-        self.client = TelegramClient('session_' + phone_number, api_id, api_hash)
+        self.client = TelegramClient(f'session_{phone_number}', self.api_id, self.api_hash)
+
+    async def ensure_login(self):
+        await self.client.connect()
+
+        if not await self.client.is_user_authorized():
+            try:
+                await self.client.send_code_request(self.phone_number)
+                code = input("Enter login code: ")
+                await self.client.sign_in(self.phone_number, code)
+
+            except errors.SessionPasswordNeededError:
+                pw = input("Enter 2FA Password: ")
+                await self.client.sign_in(password=pw)
 
     async def list_chats(self):
-        await self.client.connect()
-
-        # Ensure you're authorized
-        if not await self.client.is_user_authorized():
-            await self.client.send_code_request(self.phone_number)
-            try:
-                await self.client.sign_in(self.phone_number, input('Enter the code: '))
-            except errors.rpcerrorlist.SessionPasswordNeededError:
-                password = input('Two-step verification is enabled. Enter your password: ')
-                await self.client.sign_in(password=password)
-
-        # Get a list of all the dialogs (chats)
+        await self.ensure_login()
         dialogs = await self.client.get_dialogs()
-        chats_file = open(f"chats_of_{self.phone_number}.txt", "w", encoding="utf-8")
-        # Print information about each chat
-        for dialog in dialogs:
-            print(f"Chat ID: {dialog.id}, Title: {dialog.title}")
-            chats_file.write(f"Chat ID: {dialog.id}, Title: {dialog.title} \n")
-          
 
-        print("List of groups printed successfully!")
+        with open(f"chats_of_{self.phone_number}.txt", "w", encoding="utf-8") as f:
+            for d in dialogs:
+                line = f"Chat ID: {d.id}, Title: {d.title}"
+                print(line)
+                f.write(line + "\n")
 
-    async def forward_messages_to_channel(self, source_chat_id, destination_channel_id, keywords):
-        await self.client.connect()
+        print("\n✅ Chats exported.\n")
 
-        # Ensure you're authorized
-        if not await self.client.is_user_authorized():
-            await self.client.send_code_request(self.phone_number)
-            await self.client.sign_in(self.phone_number, input('Enter the code: '))
+    async def forward_messages_live(self, source_chat_id, destination_chat_id):
+        """Forward ALL messages as-is (text + images + media)"""
+        await self.ensure_login()
 
-        last_message_id = (await self.client.get_messages(source_chat_id, limit=1))[0].id
+        print("\n🚀 Forwarder Started — Forwarding everything\n")
 
-        while True:
-            print("Checking for messages and forwarding them...")
-            # Get new messages since the last checked message
-            messages = await self.client.get_messages(source_chat_id, min_id=last_message_id, limit=None)
+        # FIX INVALID PEER ISSUE
+        try:
+            destination_peer = await self.client.get_entity(destination_chat_id)
+        except Exception as e:
+            print("\n❌ Cannot resolve destination peer!")
+            print("Make sure:")
+            print("- You joined the channel/group")
+            print("- You have permission to send")
+            print("- ID is correct")
+            print("Error:", e)
+            return
 
-            for message in reversed(messages):
-                # Check if the message text includes any of the keywords
-                if keywords:
-                    if message.text and any(keyword in message.text.lower() for keyword in keywords):
-                        print(f"Message contains a keyword: {message.text}")
+        @self.client.on(events.NewMessage(chats=source_chat_id))
+        async def handler(event):
+            try:
+                text = event.message.message or ""
 
-                        # Forward the message to the destination channel
-                        await self.client.send_message(destination_channel_id, message.text)
+                if event.message.photo or event.message.file:
+                    # Image / photo / file with its original caption
+                    await self.client.send_file(
+                        destination_peer,
+                        file=event.message.media,
+                        caption=text if text else None
+                    )
+                    print("🖼️ Forwarded MEDIA")
 
-                        print("Message forwarded")
                 else:
-                        # Forward the message to the destination channel
-                        await self.client.send_message(destination_channel_id, message.text)
+                    # Text-only message
+                    await self.client.send_message(destination_peer, text)
+                    print("📤 Forwarded TEXT:", text)
 
-                        print("Message forwarded")
+            except Exception as e:
+                print("❌ Error Forwarding:", e)
 
-
-                # Update the last message ID
-                last_message_id = max(last_message_id, message.id)
-
-            # Add a delay before checking for new messages again
-            await asyncio.sleep(5)  # Adjust the delay time as needed
+        # RUN FOREVER
+        await self.client.run_until_disconnected()
 
 
-# Function to read credentials from file
-def read_credentials():
+# -------------------------------
+# CREDENTIALS FUNCTIONS
+# -------------------------------
+
+def load_credentials():
     try:
-        with open("credentials.txt", "r") as file:
-            lines = file.readlines()
-            api_id = lines[0].strip()
-            api_hash = lines[1].strip()
-            phone_number = lines[2].strip()
-            return api_id, api_hash, phone_number
-    except FileNotFoundError:
-        print("Credentials file not found.")
+        with open("credentials.txt", "r") as f:
+            api_id = f.readline().strip()
+            api_hash = f.readline().strip()
+            phone = f.readline().strip()
+        return api_id, api_hash, phone
+    except:
         return None, None, None
 
-# Function to write credentials to file
-def write_credentials(api_id, api_hash, phone_number):
-    with open("credentials.txt", "w") as file:
-        file.write(api_id + "\n")
-        file.write(api_hash + "\n")
-        file.write(phone_number + "\n")
+
+def save_credentials(api_id, api_hash, phone):
+    with open("credentials.txt", "w") as f:
+        f.write(api_id + "\n" + api_hash + "\n" + phone)
+
+
+# -------------------------------
+# MAIN PROGRAM
+# -------------------------------
 
 async def main():
-    # Attempt to read credentials from file
-    api_id, api_hash, phone_number = read_credentials()
+    api_id, api_hash, phone_number = load_credentials()
 
-    # If credentials not found in file, prompt the user to input them
-    if api_id is None or api_hash is None or phone_number is None:
-        api_id = input("Enter your API ID: ")
-        api_hash = input("Enter your API Hash: ")
-        phone_number = input("Enter your phone number: ")
-        # Write credentials to file for future use
-        write_credentials(api_id, api_hash, phone_number)
+    if not api_id or not api_hash or not phone_number:
+        api_id = input("API ID: ")
+        api_hash = input("API Hash: ")
+        phone_number = input("Phone number: ")
+        save_credentials(api_id, api_hash, phone_number)
 
-    forwarder = TelegramForwarder(api_id, api_hash, phone_number)
-    
-    print("Choose an option:")
+    bot = TelegramForwarder(api_id, api_hash, phone_number)
+
+    print("\nChoose an option:")
     print("1. List Chats")
-    print("2. Forward Messages")
-    
-    choice = input("Enter your choice: ")
-    
-    if choice == "1":
-        await forwarder.list_chats()
-    elif choice == "2":
-        source_chat_id = int(input("Enter the source chat ID: "))
-        destination_channel_id = int(input("Enter the destination chat ID: "))
-        print("Enter keywords if you want to forward messages with specific keywords, or leave blank to forward every message!")
-        keywords = input("Put keywords (comma separated if multiple, or leave blank): ").split(",")
-        
-        await forwarder.forward_messages_to_channel(source_chat_id, destination_channel_id, keywords)
-    else:
-        print("Invalid choice")
+    print("2. Start Forwarding\n")
+    choice = input("Your choice: ")
 
-# Start the event loop and run the main function
+    if choice == "1":
+        await bot.list_chats()
+
+    elif choice == "2":
+        source = int(input("Source Chat ID: "))
+        dest = int(input("Destination Chat ID: "))
+
+        await bot.forward_messages_live(source, dest)
+
+    else:
+        print("❌ Invalid choice.")
+
 if __name__ == "__main__":
     asyncio.run(main())
