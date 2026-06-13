@@ -1,12 +1,27 @@
+import os
+import sys
 import asyncio
 from telethon import TelegramClient, events, errors
+from telethon.sessions import StringSession
+
 
 class TelegramForwarder:
-    def __init__(self, api_id, api_hash, phone_number):
+    def __init__(self, api_id, api_hash, phone_number=None, session_string=None):
         self.api_id = int(api_id)
         self.api_hash = api_hash
         self.phone_number = phone_number
-        self.client = TelegramClient(f'session_{phone_number}', self.api_id, self.api_hash)
+
+        # On a server we authenticate with a pre-generated StringSession so we
+        # never need to type a login code. Locally we fall back to a session
+        # file keyed by phone number.
+        if session_string:
+            session = StringSession(session_string)
+        elif phone_number:
+            session = f'session_{phone_number}'
+        else:
+            session = StringSession()
+
+        self.client = TelegramClient(session, self.api_id, self.api_hash)
 
     async def ensure_login(self):
         await self.client.connect()
@@ -98,10 +113,63 @@ def save_credentials(api_id, api_hash, phone):
 
 
 # -------------------------------
+# SESSION STRING GENERATOR (run locally once)
+# -------------------------------
+
+async def generate_session_string():
+    """Run locally: logs in interactively and prints a SESSION_STRING to copy
+    into Railway's environment variables."""
+    api_id = os.environ.get("API_ID") or input("API ID: ")
+    api_hash = os.environ.get("API_HASH") or input("API Hash: ")
+    phone = os.environ.get("PHONE") or input("Phone number: ")
+
+    client = TelegramClient(StringSession(), int(api_id), api_hash)
+    await client.connect()
+
+    if not await client.is_user_authorized():
+        await client.send_code_request(phone)
+        try:
+            await client.sign_in(phone, input("Enter login code: "))
+        except errors.SessionPasswordNeededError:
+            await client.sign_in(password=input("Enter 2FA Password: "))
+
+    print("\n✅ Copy this SESSION_STRING into your Railway variables:\n")
+    print(client.session.save())
+    print()
+    await client.disconnect()
+
+
+# -------------------------------
+# DEPLOY MODE (Railway / any server) — driven by env vars
+# -------------------------------
+
+async def run_from_env():
+    api_id = os.environ["API_ID"]
+    api_hash = os.environ["API_HASH"]
+    session_string = os.environ["SESSION_STRING"]
+    source = int(os.environ["SOURCE_CHAT_ID"])
+    dest = int(os.environ["DEST_CHAT_ID"])
+
+    bot = TelegramForwarder(api_id, api_hash, session_string=session_string)
+    await bot.forward_messages_live(source, dest)
+
+
+# -------------------------------
 # MAIN PROGRAM
 # -------------------------------
 
 async def main():
+    # `python TelegramForwarder.py login` -> generate a session string locally
+    if len(sys.argv) > 1 and sys.argv[1] == "login":
+        await generate_session_string()
+        return
+
+    # If deploy env vars are present (e.g. on Railway), run automatically.
+    if os.environ.get("SESSION_STRING") and os.environ.get("SOURCE_CHAT_ID"):
+        await run_from_env()
+        return
+
+    # Otherwise: local interactive mode.
     api_id, api_hash, phone_number = load_credentials()
 
     if not api_id or not api_hash or not phone_number:
@@ -128,6 +196,7 @@ async def main():
 
     else:
         print("❌ Invalid choice.")
+
 
 if __name__ == "__main__":
     asyncio.run(main())
